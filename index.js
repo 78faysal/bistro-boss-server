@@ -2,8 +2,20 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const app = express();
+const formData = require("form-data");
+const Mailgun = require("mailgun.js");
+const mailgun = new Mailgun(formData);
+// const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const stripe = require("stripe")(
+  "sk_test_51OWJoOGE9TWQ10aqF1WOgLL4xDE4onkQdxBIqBHDa9rhsPJ0teN4hlUiDqctRayh7g0ZZV4AKpnTZy2tgowbzdT80015xYkvZM"
+);
 const port = process.env.PORT || 5000;
 require("dotenv").config();
+
+const mg = mailgun.client({
+  username: "api",
+  key: process.env.MAIL_GUN_API_KEY,
+});
 
 // midleware
 app.use(cors());
@@ -24,18 +36,20 @@ const client = new MongoClient(uri, {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
+    // client.connect();
 
     const menuCollection = client.db("bistroDb").collection("menu");
     const userCollection = client.db("bistroDb").collection("users");
     const reviewCollection = client.db("bistroDb").collection("reviews");
     const cartCollection = client.db("bistroDb").collection("carts");
+    const paymentCollection = client.db("bistroDb").collection("payments");
 
     // jwt related api
     app.post("/jwt", async (req, res) => {
       const user = req.body;
       const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
-        expiresIn: "1h",
+        expiresIn: "6h",
       });
       res.send({ token });
     });
@@ -135,10 +149,9 @@ async function run() {
       const query = { _id: id };
       const result = await menuCollection.findOne(query);
       // console.log(result);
-      try{
+      try {
         res.send(result);
-      }
-      catch(err){
+      } catch (err) {
         console.log(err);
       }
     });
@@ -149,22 +162,22 @@ async function run() {
       res.send(result);
     });
 
-    app.patch('/menu/:id', verifyToken, verifyAdmin, async(req, res) => {
+    app.patch("/menu/:id", verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
       const item = req.body;
-      const filter = {_id: id};
+      const filter = { _id: id };
       const updatedDoc = {
         $set: {
           name: item.name,
           category: item.category,
           price: item.price,
           recipe: item.recipe,
-          image: item.image
-        }
-      }
+          image: item.image,
+        },
+      };
       const result = await menuCollection.updateOne(filter, updatedDoc);
-      res.send(result)
-    })
+      res.send(result);
+    });
 
     app.delete("/menu/:id", verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
@@ -199,11 +212,143 @@ async function run() {
       res.send(result);
     });
 
+    // payment intent
+    app.post("/create-payment-intent", async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      });
+    });
+
+    app.get("/payments/:email", verifyToken, async (req, res) => {
+      const query = { email: req.params.email };
+      if (req.params.email !== req.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      const result = await paymentCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    app.post("/payments", async (req, res) => {
+      const payment = req.body;
+      const paymentResult = await paymentCollection.insertOne(payment);
+
+      // delete each item from the cart carefully
+      console.log("payment info", payment);
+      const query = {
+        _id: {
+          $in: payment.cartIds.map((id) => new ObjectId(id)),
+        },
+      };
+      const deleteResult = await paymentCollection.deleteMany(query);
+
+      // send user email about payment confirm
+      mg.messages
+        .create(process.env.MAIL_SENDING_DOMAIN, {
+          from: "Mailgun Sandbox <postmaster@sandbox620a9dde014444cb8b041bb8158e9030.mailgun.org>",
+          to: ["faysal7830@gmail.com"],
+          subject: "Bistro Boss Order Confirmation",
+          text: "Testing some Mailgun awesomness!",
+          html: `
+            <div>
+              <h2>Thanks For your order</h2>
+              <h4>Your Transaction ID: <strong>${payment.transactionId}</strong></h4>
+              <p>Your feedback will help us to improve ourself </p>
+            </div>
+          `
+        })
+        .then((msg) => console.log(msg)) // logs response data
+        .catch((err) => console.log(err));
+
+      res.send({ paymentResult, deleteResult });
+    });
+
+    // stats or analytics
+    app.get("/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
+      const users = await userCollection.estimatedDocumentCount();
+      const menuItems = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+
+      // not the best way
+      // const payments = await paymentCollection.find().toArray();
+      // const revenue = payments.reduce((total, payment) => total + payment.price, 0)
+
+      const result = await paymentCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalRevenue: {
+                $sum: "$price",
+              },
+            },
+          },
+        ])
+        .toArray();
+
+      const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+
+      res.send({
+        users,
+        menuItems,
+        orders,
+        revenue,
+      });
+    });
+
+    // using aggregate pipeline
+    app.get("/order-stats", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await paymentCollection
+        .aggregate([
+          {
+            $unwind: "$menuItemIds",
+          },
+          {
+            $lookup: {
+              from: "menu",
+              localField: "menuItemIds",
+              foreignField: "_id",
+              as: "menuItems",
+            },
+          },
+          {
+            $unwind: "$menuItems",
+          },
+          {
+            $group: {
+              _id: "$menuItems.category",
+              quantity: { $sum: 1 },
+              revenue: { $sum: "$menuItems.price" },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              category: "$_id",
+              quantity: "$quantity",
+              revenue: "$revenue",
+            },
+          },
+        ])
+        .toArray();
+
+      res.send(result);
+    });
+
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
-    );
+    // await client.db("admin").command({ ping: 1 });
+    // client.db("admin").command({ ping: 1 });
+    // console.log(
+    //   "Pinged your deployment. You successfully connected to MongoDB!"
+    // );
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
